@@ -34,18 +34,34 @@ fn get_logfile(name: &str, rand: &str) -> String {
 
 fn collect_syslog(rand: &str) -> Result<()> {
     let ctrl_events = ctrl_channel()?;
-    let f_sys = File::create(get_logfile(SYSLOG_FNAME, rand))?;
+    let mut f_sys = File::create(get_logfile(SYSLOG_FNAME, rand))?;
+    let ctime = Local::now();
+    let ctime_iso: String = ctime.format("%+").to_string();
+    let ctime_dt = DateTime::parse_from_rfc3339(&ctime_iso).unwrap();
 
-    let mut logger = Command::new("dmesg")
-        .arg("--time-format")
-        .arg("iso")
-        .arg("-w")
-        .stdout(Stdio::from(f_sys))
-        .spawn()
-        .expect("logger failed to start");
+    thread::spawn(move || -> Result<()> {
+        let mut logger = Command::new("dmesg")
+            .arg("--time-format")
+            .arg("iso")
+            .arg("-w")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Failed to execute dmesg");
 
-    ctrl_events.recv().unwrap();
-    logger.kill()?;
+        let reader = io::BufReader::new(logger.stdout.take().expect("Failed to capture stdout"));
+        for line in reader.lines() {
+            let _line: &str = &line?;
+            if let Ok(date) = get_date(&Some(Ok(_line.to_string()))) {
+                if date >= ctime_dt {
+                    write!(f_sys, "{}", get_line(&Some(Ok(_line.to_string())))?)?;
+                }
+            }
+        }
+        ctrl_events.recv().unwrap();
+        logger.kill()?;
+        Ok(())
+    });
+
     Ok(())
 }
 
@@ -57,7 +73,12 @@ fn collect_stdin(rand: &str) -> Result<()> {
         for line_result in stdin.lock().lines() {
             let line = line_result?;
             let dt = Local::now();
-            let _str = format!("{} {}\n", dt.format("%+"), line);
+            // Use comma for the decimal separator as in dmesg's output
+            let _str = format!(
+                "{} {}\n",
+                dt.format("%+").to_string().replace(".", ","),
+                line
+            );
             write!(f_in, "{}", &_str)?;
         }
         Ok(())
