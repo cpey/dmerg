@@ -5,15 +5,17 @@
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, FixedOffset, Local};
-use std::fs::File;
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
+use std::fs::{self, File};
 use std::io::{self, prelude::*};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
-const SYSLOG_FNAME: &str = "syslog.log";
-const STDIN_FNAME: &str = "stdin.log";
-const FUSED_FNAME: &str = "result.log";
+const SYSLOG_FNAME: &str = "/tmp/syslog";
+const STDIN_FNAME: &str = "/tmp/stdin";
+const FUSED_FNAME: &str = "result";
 const UNIXTIME: &str = "1970-01-01T00:00:00.000000+00:00";
 
 fn ctrl_channel() -> Result<mpsc::Receiver<()>> {
@@ -25,9 +27,14 @@ fn ctrl_channel() -> Result<mpsc::Receiver<()>> {
     Ok(receiver)
 }
 
-fn collect_syslog() -> Result<()> {
+fn get_logfile(name: &str, rand: &str) -> String {
+    let filename: String = format!("{}_{}.log", name, rand);
+    return filename;
+}
+
+fn collect_syslog(rand: &str) -> Result<()> {
     let ctrl_events = ctrl_channel()?;
-    let f_sys = File::create(SYSLOG_FNAME)?;
+    let f_sys = File::create(get_logfile(SYSLOG_FNAME, rand))?;
 
     let mut logger = Command::new("dmesg")
         .arg("--time-format")
@@ -42,17 +49,15 @@ fn collect_syslog() -> Result<()> {
     Ok(())
 }
 
-fn collect_stdin() -> Result<()> {
-    let mut f_in = File::create(STDIN_FNAME)?;
+fn collect_stdin(rand: &str) -> Result<()> {
+    let mut f_in = File::create(get_logfile(STDIN_FNAME, rand))?;
 
     let thread = thread::spawn(move || -> Result<()> {
-        let dt = Local::now();
         let stdin = io::stdin();
-        let mut _str;
-
         for line_result in stdin.lock().lines() {
             let line = line_result?;
-            _str = format!("{} {}\n", dt.format("%+"), line);
+            let dt = Local::now();
+            let _str = format!("{} {}\n", dt.format("%+"), line);
             write!(f_in, "{}", &_str)?;
         }
         Ok(())
@@ -62,9 +67,9 @@ fn collect_stdin() -> Result<()> {
     Ok(())
 }
 
-fn collect_logs() -> Result<()> {
-    collect_syslog()?;
-    collect_stdin()
+fn collect_logs(rand: &str) -> Result<()> {
+    collect_syslog(&rand)?;
+    collect_stdin(&rand)
 }
 
 fn read_lines(filename: &str) -> Result<io::Lines<io::BufReader<File>>, anyhow::Error> {
@@ -113,46 +118,46 @@ fn get_date(
     }
 }
 
-fn fuse_logs() -> Result<()> {
+fn fuse_logs(rand: &str) -> Result<()> {
     let mut _line_stdin: Option<Result<String, std::io::Error>> = None;
     let mut _line_syslog: Option<Result<String, std::io::Error>> = None;
 
     let mut stdin_date = DateTime::parse_from_rfc3339(&UNIXTIME).unwrap();
     let mut syslog_date = DateTime::parse_from_rfc3339(&UNIXTIME).unwrap();
 
-    let mut syslog_lines = read_lines(SYSLOG_FNAME)?;
-    let mut stdin_lines = read_lines(STDIN_FNAME)?;
-    let mut f_out = File::create(FUSED_FNAME)?;
+    let mut syslog_lines = read_lines(&get_logfile(SYSLOG_FNAME, rand))?;
+    let mut stdin_lines = read_lines(&get_logfile(STDIN_FNAME, rand))?;
+    let mut f_out = File::create(get_logfile(FUSED_FNAME, rand))?;
 
-    let mut exhausted_stdin = false;
-    let mut exhausted_syslog = false;
-    let mut used_stdin = true;
-    let mut used_syslog = true;
+    let mut end_stdin = false;
+    let mut end_syslog = false;
+    let mut next_stdin = true;
+    let mut next_syslog = true;
 
     loop {
-        if used_stdin {
+        if next_stdin {
             _line_stdin = stdin_lines.next();
             match get_date(&_line_stdin) {
                 Ok(v) => {
                     stdin_date = v;
-                    used_stdin = false;
+                    next_stdin = false;
                 }
                 Err(_) => {
-                    exhausted_stdin = true;
+                    end_stdin = true;
                     break;
                 }
             }
         }
 
-        if used_syslog {
+        if next_syslog {
             _line_syslog = syslog_lines.next();
             match get_date(&_line_syslog) {
                 Ok(v) => {
                     syslog_date = v;
-                    used_syslog = false;
+                    next_syslog = false;
                 }
                 Err(_) => {
-                    exhausted_syslog = true;
+                    end_syslog = true;
                     break;
                 }
             }
@@ -160,14 +165,14 @@ fn fuse_logs() -> Result<()> {
 
         if syslog_date < stdin_date {
             write!(f_out, "{}", get_line(&_line_syslog)?)?;
-            used_syslog = true;
+            next_syslog = true;
         } else {
             write!(f_out, "{}", get_line(&_line_stdin)?)?;
-            used_stdin = true;
+            next_stdin = true;
         }
     }
 
-    if exhausted_stdin {
+    if end_stdin {
         loop {
             if let Ok(_line) = get_line(&_line_syslog) {
                 write!(f_out, "{}", _line)?;
@@ -176,7 +181,7 @@ fn fuse_logs() -> Result<()> {
             }
             _line_syslog = syslog_lines.next();
         }
-    } else if exhausted_syslog {
+    } else if end_syslog {
         loop {
             if let Ok(_line) = get_line(&_line_stdin) {
                 write!(f_out, "{}", _line)?;
@@ -190,8 +195,20 @@ fn fuse_logs() -> Result<()> {
     Ok(())
 }
 
+fn remove_tmp_files(rand: &str) -> Result<()> {
+    fs::remove_file(get_logfile(SYSLOG_FNAME, rand))?;
+    fs::remove_file(get_logfile(STDIN_FNAME, rand))?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
-    collect_logs()?;
-    fuse_logs()?;
+    let rand: String = thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(30)
+        .map(char::from)
+        .collect();
+    collect_logs(&rand)?;
+    fuse_logs(&rand)?;
+    remove_tmp_files(&rand)?;
     Ok(())
 }

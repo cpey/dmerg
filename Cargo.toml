@@ -10,3 +10,4 @@ edition = "2018"
 ctrlc = { version = "3.0", features = ["termination"] }
 anyhow = "1.0"
 chrono = "0.2"
+rand = "0.8.4"
