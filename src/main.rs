@@ -29,7 +29,7 @@ fn ctrl_channel() -> Result<mpsc::Receiver<()>> {
 }
 
 fn get_logfile(name: &str, rand: &str) -> String {
-    let filename: String = format!("{}_{}.log", name, rand);
+    let filename: String = format!("{}_{}", name, rand);
     return filename;
 }
 
@@ -39,7 +39,8 @@ fn collect_syslog(rand: &str, args: &Opt) -> Result<()> {
     let ctime = Local::now();
     let ctime_iso: String = ctime.format("%+").to_string();
     let ctime_dt = DateTime::parse_from_rfc3339(&ctime_iso).unwrap();
-    let history = args.history;
+    let full = args.full;
+    let mute = args.mute;
 
     thread::spawn(move || -> Result<()> {
         let mut logger = Command::new("dmesg")
@@ -54,10 +55,12 @@ fn collect_syslog(rand: &str, args: &Opt) -> Result<()> {
         for line in reader.lines() {
             let _line: &str = &line?;
             if let Ok(date) = get_date(&Some(Ok(_line.to_string()))) {
-                if history {
+                if full || date >= ctime_dt {
                     write!(f_sys, "{}", get_line(&Some(Ok(_line.to_string())))?)?;
-                } else if date >= ctime_dt {
-                    write!(f_sys, "{}", get_line(&Some(Ok(_line.to_string())))?)?;
+                    if !mute {
+                        print!("{}", get_line(&Some(Ok(_line.to_string())))?);
+                        io::stdout().flush().unwrap();
+                    }
                 }
             }
         }
@@ -69,8 +72,9 @@ fn collect_syslog(rand: &str, args: &Opt) -> Result<()> {
     Ok(())
 }
 
-fn collect_stdin(rand: &str) -> Result<()> {
+fn collect_stdin(rand: &str, args: &Opt) -> Result<()> {
     let mut f_in = File::create(get_logfile(STDIN_FNAME, rand))?;
+    let mute = args.mute;
 
     let thread = thread::spawn(move || -> Result<()> {
         let stdin = io::stdin();
@@ -84,6 +88,10 @@ fn collect_stdin(rand: &str) -> Result<()> {
                 line
             );
             write!(f_in, "{}", &_str)?;
+            if !mute {
+                print!("{}", &_str);
+                io::stdout().flush().unwrap();
+            }
         }
         Ok(())
     });
@@ -94,7 +102,7 @@ fn collect_stdin(rand: &str) -> Result<()> {
 
 fn collect_logs(rand: &str, args: &Opt) -> Result<()> {
     collect_syslog(&rand, &args)?;
-    collect_stdin(&rand)
+    collect_stdin(&rand, &args)
 }
 
 fn read_lines(filename: &str) -> Result<io::Lines<io::BufReader<File>>, anyhow::Error> {
@@ -143,7 +151,13 @@ fn get_date(
     }
 }
 
-fn fuse_logs(rand: &str) -> Result<()> {
+fn fuse_logs(rand: &str, args: &Opt) -> Result<()> {
+    let output_file: String;
+    match &args.output {
+        Some(v) => output_file = v.to_string(),
+        None => output_file = get_logfile(FUSED_FNAME, rand),
+    }
+
     let mut _line_stdin: Option<Result<String, std::io::Error>> = None;
     let mut _line_syslog: Option<Result<String, std::io::Error>> = None;
 
@@ -152,7 +166,7 @@ fn fuse_logs(rand: &str) -> Result<()> {
 
     let mut syslog_lines = read_lines(&get_logfile(SYSLOG_FNAME, rand))?;
     let mut stdin_lines = read_lines(&get_logfile(STDIN_FNAME, rand))?;
-    let mut f_out = File::create(get_logfile(FUSED_FNAME, rand))?;
+    let mut f_out = File::create(output_file)?;
 
     let mut end_stdin = false;
     let mut end_syslog = false;
@@ -226,11 +240,34 @@ fn remove_tmp_files(rand: &str) -> Result<()> {
     Ok(())
 }
 
+fn notify_result(rand: &str, args: &Opt) -> Result<()> {
+    let output_file: String;
+    let mut rand_file = false;
+    match &args.output {
+        Some(v) => output_file = v.to_string(),
+        None => {
+            output_file = get_logfile(FUSED_FNAME, rand);
+            rand_file = true
+        }
+    }
+
+    if !args.mute || rand_file {
+        println!("\n+ Output written to {}", output_file);
+    }
+    Ok(())
+}
+
 #[derive(StructOpt)]
 struct Opt {
-    /// Include full dmesg output
+    /// Include full dmesg output.
     #[structopt(short, long)]
-    history: bool,
+    full: bool,
+    /// Write output to <output> instead of a randomly generated file.
+    #[structopt(short, long)]
+    output: Option<String>,
+    /// Do not write to the standard output.
+    #[structopt(short, long)]
+    mute: bool,
 }
 
 fn main() -> Result<()> {
@@ -241,7 +278,8 @@ fn main() -> Result<()> {
         .map(char::from)
         .collect();
     collect_logs(&rand, &args)?;
-    fuse_logs(&rand)?;
+    fuse_logs(&rand, &args)?;
     remove_tmp_files(&rand)?;
+    notify_result(&rand, &args)?;
     Ok(())
 }
