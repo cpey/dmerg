@@ -8,10 +8,11 @@ use chrono::{DateTime, FixedOffset, Local};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use std::fs::{self, File};
-use std::io::{self, prelude::*};
+use std::io::{self, prelude::*, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
+use structopt::StructOpt;
 
 const SYSLOG_FNAME: &str = "/tmp/syslog";
 const STDIN_FNAME: &str = "/tmp/stdin";
@@ -32,12 +33,13 @@ fn get_logfile(name: &str, rand: &str) -> String {
     return filename;
 }
 
-fn collect_syslog(rand: &str) -> Result<()> {
+fn collect_syslog(rand: &str, args: &Opt) -> Result<()> {
     let ctrl_events = ctrl_channel()?;
     let mut f_sys = File::create(get_logfile(SYSLOG_FNAME, rand))?;
     let ctime = Local::now();
     let ctime_iso: String = ctime.format("%+").to_string();
     let ctime_dt = DateTime::parse_from_rfc3339(&ctime_iso).unwrap();
+    let history = args.history;
 
     thread::spawn(move || -> Result<()> {
         let mut logger = Command::new("dmesg")
@@ -52,7 +54,9 @@ fn collect_syslog(rand: &str) -> Result<()> {
         for line in reader.lines() {
             let _line: &str = &line?;
             if let Ok(date) = get_date(&Some(Ok(_line.to_string()))) {
-                if date >= ctime_dt {
+                if history {
+                    write!(f_sys, "{}", get_line(&Some(Ok(_line.to_string())))?)?;
+                } else if date >= ctime_dt {
                     write!(f_sys, "{}", get_line(&Some(Ok(_line.to_string())))?)?;
                 }
             }
@@ -73,7 +77,7 @@ fn collect_stdin(rand: &str) -> Result<()> {
         for line_result in stdin.lock().lines() {
             let line = line_result?;
             let dt = Local::now();
-            // Use comma for the decimal separator as in dmesg's output
+            // Use comma for the decimal separator as in dmesg output
             let _str = format!(
                 "{} {}\n",
                 dt.format("%+").to_string().replace(".", ","),
@@ -88,8 +92,8 @@ fn collect_stdin(rand: &str) -> Result<()> {
     Ok(())
 }
 
-fn collect_logs(rand: &str) -> Result<()> {
-    collect_syslog(&rand)?;
+fn collect_logs(rand: &str, args: &Opt) -> Result<()> {
+    collect_syslog(&rand, &args)?;
     collect_stdin(&rand)
 }
 
@@ -222,13 +226,21 @@ fn remove_tmp_files(rand: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(StructOpt)]
+struct Opt {
+    /// Include full dmesg output
+    #[structopt(short, long)]
+    history: bool,
+}
+
 fn main() -> Result<()> {
+    let args = Opt::from_args();
     let rand: String = thread_rng()
         .sample_iter(&Alphanumeric)
         .take(30)
         .map(char::from)
         .collect();
-    collect_logs(&rand)?;
+    collect_logs(&rand, &args)?;
     fuse_logs(&rand)?;
     remove_tmp_files(&rand)?;
     Ok(())
