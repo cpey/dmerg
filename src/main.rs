@@ -8,33 +8,39 @@ use chrono::{DateTime, FixedOffset, Local};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use std::fs::{self, File};
-use std::io::{self, prelude::*, Write};
+use std::io::{self, prelude::*, stdout, Write};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use structopt::StructOpt;
 
-const SYSLOG_FNAME: &str = "/tmp/syslog";
-const STDIN_FNAME: &str = "/tmp/stdin";
-const FUSED_FNAME: &str = "result";
+const SYSLOG_FNAME: &str = "/tmp/dmerg.syslog";
+const STDIN_FNAME: &str = "/tmp/dmerg.stdin";
+const FUSED_FNAME: &str = "dmerged";
 const UNIXTIME: &str = "1970-01-01T00:00:00.000000+00:00";
 
-fn ctrl_channel() -> Result<mpsc::Receiver<()>> {
-    let (sender, receiver) = mpsc::channel();
+fn ctrl_channel() -> Result<(Receiver<()>, Receiver<()>)> {
+    let (sender, receiver) = channel();
+    let (sender2, receiver2) = channel();
+
     ctrlc::set_handler(move || {
         let _ = sender.send(());
+        let _ = sender2.send(());
     })?;
 
-    Ok(receiver)
+    Ok((receiver, receiver2))
 }
 
 fn get_logfile(name: &str, rand: &str) -> String {
-    let filename: String = format!("{}_{}", name, rand);
+    let filename: String = format!("{}.{}", name, rand);
     return filename;
 }
 
-fn collect_syslog(rand: &str, args: &Opt) -> Result<()> {
-    let ctrl_events = ctrl_channel()?;
+fn collect_syslog(
+    rand: &str,
+    args: &Opt,
+    recv: Receiver<()>,
+) -> Result<thread::JoinHandle<Result<(), anyhow::Error>>> {
     let mut f_sys = File::create(get_logfile(SYSLOG_FNAME, rand))?;
     let ctime = Local::now();
     let ctime_iso: String = ctime.format("%+").to_string();
@@ -42,7 +48,7 @@ fn collect_syslog(rand: &str, args: &Opt) -> Result<()> {
     let full = args.full;
     let mute = args.mute;
 
-    thread::spawn(move || -> Result<()> {
+    let thread = thread::spawn(move || -> Result<()> {
         let mut logger = Command::new("dmesg")
             .arg("--time-format")
             .arg("iso")
@@ -51,7 +57,8 @@ fn collect_syslog(rand: &str, args: &Opt) -> Result<()> {
             .spawn()
             .expect("Failed to execute dmesg");
 
-        let reader = io::BufReader::new(logger.stdout.take().expect("Failed to capture stdout"));
+        let mut reader =
+            io::BufReader::new(logger.stdout.take().expect("Failed to capture stdout"));
         for line in reader.lines() {
             let _line: &str = &line?;
             if let Ok(date) = get_date(&Some(Ok(_line.to_string()))) {
@@ -64,45 +71,103 @@ fn collect_syslog(rand: &str, args: &Opt) -> Result<()> {
                 }
             }
         }
-        ctrl_events.recv().unwrap();
+        recv.recv().unwrap();
         logger.kill()?;
         Ok(())
     });
 
-    Ok(())
+    return Ok(thread);
 }
 
-fn collect_stdin(rand: &str, args: &Opt) -> Result<()> {
+fn get_stdin() -> Result<Receiver<String>> {
+    let (tx, rx) = channel();
+    let mut input: String = "".to_string();
+    let stdin = io::stdin();
+    thread::spawn(move || {
+        for line_result in stdin.lock().lines() {
+            match line_result {
+                Ok(l) => {
+                    input = l;
+                }
+                Err(_) => {
+                    continue;
+                }
+            }
+            tx.send(input);
+        }
+    });
+
+    Ok(rx)
+}
+
+fn collect_stdin(
+    rand: &str,
+    args: &Opt,
+    recv: Receiver<()>,
+) -> Result<thread::JoinHandle<Result<(), anyhow::Error>>> {
     let mut f_in = File::create(get_logfile(STDIN_FNAME, rand))?;
     let mute = args.mute;
-
     let thread = thread::spawn(move || -> Result<()> {
-        let stdin = io::stdin();
-        for line_result in stdin.lock().lines() {
-            let line = line_result?;
-            let dt = Local::now();
-            // Use comma for the decimal separator as in dmesg output
-            let _str = format!(
-                "{} {}\n",
-                dt.format("%+").to_string().replace(".", ","),
-                line
-            );
-            write!(f_in, "{}", &_str)?;
-            if !mute {
-                print!("{}", &_str);
-                io::stdout().flush().unwrap();
+        let mut rx;
+        match get_stdin() {
+            Ok(r) => rx = r,
+            Err(_) => return Err(anyhow!("Error generating communication channels")),
+        }
+
+        loop {
+            match rx.try_recv() {
+                Ok(i) => {
+                    let line = i;
+                    let dt = Local::now();
+                    // Use comma for the decimal separator as in dmesg output
+                    let _str = format!(
+                        "{} {}\n",
+                        dt.format("%+").to_string().replace(".", ","),
+                        line
+                    );
+                    write!(f_in, "{}", &_str)?;
+                    if !mute {
+                        print!("{}", &_str);
+                        io::stdout().flush().unwrap();
+                    }
+                }
+                Err(_) => {}
+            }
+            match recv.try_recv() {
+                Ok(()) => break,
+                Err(_) => {}
             }
         }
         Ok(())
     });
 
-    thread.join().unwrap()?;
-    Ok(())
+    return Ok(thread);
 }
 
 fn collect_logs(rand: &str, args: &Opt) -> Result<()> {
-    collect_syslog(&rand, &args)?;
-    collect_stdin(&rand, &args)
+    let receivers;
+    let th_stdin;
+    let th_syslog;
+
+    match ctrl_channel() {
+        Ok(r) => receivers = r,
+        Err(_) => return Err(anyhow!("Error generating communication channels")),
+    };
+
+    match collect_syslog(&rand, &args, receivers.0) {
+        Ok(t) => th_syslog = t,
+        Err(_) => return Err(anyhow!("Error generating thread")),
+    }
+
+    match collect_stdin(&rand, &args, receivers.1) {
+        Ok(t) => th_stdin = t,
+        Err(_) => return Err(anyhow!("Error generating thread")),
+    }
+
+    th_syslog.join().unwrap();
+    th_stdin.join().unwrap();
+
+    return Ok(());
 }
 
 fn read_lines(filename: &str) -> Result<io::Lines<io::BufReader<File>>, anyhow::Error> {
@@ -119,9 +184,13 @@ fn get_line(line: &Option<Result<String, std::io::Error>>) -> Result<String, any
                 _str = v.to_string() + "\n";
                 return Ok(_str);
             }
-            Err(_) => return Err(anyhow!("Error processing line")),
+            Err(e) => {
+                return Err(anyhow!("Error processing line: {}", e));
+            }
         },
-        None => Err(anyhow!("Error processing line")),
+        None => {
+            return Err(anyhow!("Error processing line"));
+        }
     }
 }
 
@@ -151,7 +220,7 @@ fn get_date(
     }
 }
 
-fn fuse_logs(rand: &str, args: &Opt) -> Result<()> {
+fn merge_logs(rand: &str, args: &Opt) -> Result<()> {
     let output_file: String;
     match &args.output {
         Some(v) => output_file = v.to_string(),
@@ -183,7 +252,6 @@ fn fuse_logs(rand: &str, args: &Opt) -> Result<()> {
                 }
                 Err(_) => {
                     end_stdin = true;
-                    break;
                 }
             }
         }
@@ -197,9 +265,13 @@ fn fuse_logs(rand: &str, args: &Opt) -> Result<()> {
                 }
                 Err(_) => {
                     end_syslog = true;
-                    break;
                 }
             }
+        }
+
+        // We exit the loop here to be sure each file is read at least once
+        if end_stdin || end_syslog {
+            break;
         }
 
         if syslog_date < stdin_date {
@@ -278,7 +350,7 @@ fn main() -> Result<()> {
         .map(char::from)
         .collect();
     collect_logs(&rand, &args)?;
-    fuse_logs(&rand, &args)?;
+    merge_logs(&rand, &args)?;
     remove_tmp_files(&rand)?;
     notify_result(&rand, &args)?;
     Ok(())
