@@ -8,8 +8,8 @@ use chrono::{DateTime, FixedOffset, Local};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use std::fs::{self, File};
-use std::io::{self, prelude::*, stdout, Write};
-use std::process::{Command, Stdio};
+use std::io::{self, prelude::*, Write};
+use std::process::{ChildStdout, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use structopt::StructOpt;
@@ -36,6 +36,26 @@ fn get_logfile(name: &str, rand: &str) -> String {
     return filename;
 }
 
+fn get_syslog_line(reader: io::BufReader<ChildStdout>) -> Result<Receiver<String>> {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    if let Err(_) = tx.send(l) {
+                        continue;
+                    }
+                }
+                Err(_) => {
+                    continue;
+                }
+            }
+        }
+    });
+
+    Ok(rx)
+}
+
 fn collect_syslog(
     rand: &str,
     args: &Opt,
@@ -57,22 +77,37 @@ fn collect_syslog(
             .spawn()
             .expect("Failed to execute dmesg");
 
-        let mut reader =
-            io::BufReader::new(logger.stdout.take().expect("Failed to capture stdout"));
-        for line in reader.lines() {
-            let _line: &str = &line?;
-            if let Ok(date) = get_date(&Some(Ok(_line.to_string()))) {
-                if full || date >= ctime_dt {
-                    write!(f_sys, "{}", get_line(&Some(Ok(_line.to_string())))?)?;
-                    if !mute {
-                        print!("{}", get_line(&Some(Ok(_line.to_string())))?);
-                        io::stdout().flush().unwrap();
+        let rx;
+        let reader = io::BufReader::new(logger.stdout.take().expect("Failed to capture stdout"));
+        match get_syslog_line(reader) {
+            Ok(r) => rx = r,
+            Err(_) => return Err(anyhow!("Error generating communication channels")),
+        }
+
+        loop {
+            match rx.try_recv() {
+                Ok(line) => {
+                    if let Ok(date) = get_date(&Some(Ok(line.clone()))) {
+                        if full || date >= ctime_dt {
+                            write!(f_sys, "{}", get_line(&Some(Ok(line.clone())))?)?;
+                            if !mute {
+                                print!("{}", get_line(&Some(Ok(line.clone())))?);
+                                io::stdout().flush().unwrap();
+                            }
+                        }
                     }
                 }
+                Err(_) => {}
+            }
+            match recv.try_recv() {
+                Ok(()) => {
+                    logger.kill()?;
+                    break;
+                }
+                Err(_) => {}
             }
         }
-        recv.recv().unwrap();
-        logger.kill()?;
+
         Ok(())
     });
 
@@ -81,19 +116,19 @@ fn collect_syslog(
 
 fn get_stdin() -> Result<Receiver<String>> {
     let (tx, rx) = channel();
-    let mut input: String = "".to_string();
     let stdin = io::stdin();
     thread::spawn(move || {
         for line_result in stdin.lock().lines() {
             match line_result {
                 Ok(l) => {
-                    input = l;
+                    if let Err(_) = tx.send(l) {
+                        continue;
+                    }
                 }
                 Err(_) => {
                     continue;
                 }
             }
-            tx.send(input);
         }
     });
 
@@ -108,7 +143,7 @@ fn collect_stdin(
     let mut f_in = File::create(get_logfile(STDIN_FNAME, rand))?;
     let mute = args.mute;
     let thread = thread::spawn(move || -> Result<()> {
-        let mut rx;
+        let rx;
         match get_stdin() {
             Ok(r) => rx = r,
             Err(_) => return Err(anyhow!("Error generating communication channels")),
@@ -164,8 +199,8 @@ fn collect_logs(rand: &str, args: &Opt) -> Result<()> {
         Err(_) => return Err(anyhow!("Error generating thread")),
     }
 
-    th_syslog.join().unwrap();
-    th_stdin.join().unwrap();
+    th_syslog.join().unwrap()?;
+    th_stdin.join().unwrap()?;
 
     return Ok(());
 }
