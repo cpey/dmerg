@@ -19,6 +19,7 @@ const SYSLOG_FNAME: &str = "/tmp/dmerg.syslog";
 const STDIN_FNAME: &str = "/tmp/dmerg.stdin";
 const FUSED_FNAME: &str = "dmerged";
 const UNIXTIME: &str = "1970-01-01T00:00:00.000000+00:00";
+const TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6f%z";
 
 fn ctrl_channel() -> Result<(Receiver<()>, Receiver<()>)> {
     let (sender, receiver) = channel();
@@ -68,10 +69,18 @@ fn collect_syslog(
     let ctime_dt = DateTime::parse_from_rfc3339(&ctime_iso).unwrap();
     let full = args.full;
     let console_off = args.console_off;
-    let journald = args.journald;
+    let dmesg = args.dmesg;
 
     let thread = thread::spawn(move || -> Result<()> {
-        let mut logger = if journald {
+        let mut logger = if dmesg {
+            Command::new("dmesg")
+                .arg("--time-format")
+                .arg("iso")
+                .arg("-w")
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("Failed to execute dmesg")
+        } else {
             // Check we have journal access permissions
             let test = Command::new("journalctl")
                 .arg("-k")
@@ -91,14 +100,6 @@ fn collect_syslog(
                 .stdout(Stdio::piped())
                 .spawn()
                 .expect("Failed to execute journalctl")
-        } else {
-            Command::new("dmesg")
-                .arg("--time-format")
-                .arg("iso")
-                .arg("-w")
-                .stdout(Stdio::piped())
-                .spawn()
-                .expect("Failed to execute dmesg")
         };
 
         let rx;
@@ -111,11 +112,12 @@ fn collect_syslog(
         loop {
             match rx.try_recv() {
                 Ok(line) => {
-                    if let Ok(date) = get_date(&Some(Ok(line.clone()))) {
-                        if full || date >= ctime_dt {
-                            write!(f_sys, "{}", get_line(&Some(Ok(line.clone())))?)?;
+                    if let Ok(date) = get_line_split(&Some(Ok(line.clone()))) {
+                        if full || date.0 >= ctime_dt {
+                            let date_iso = date.0.format(TIME_FORMAT).to_string();
+                            writeln!(f_sys, "{} {}", &date_iso, date.1)?;
                             if !console_off {
-                                print!("{}", get_line(&Some(Ok(line.clone())))?);
+                                println!("{} {}", &date_iso, date.1);
                                 io::stdout().flush().unwrap();
                             }
                         }
@@ -178,12 +180,7 @@ fn collect_stdin(
                 Ok(i) => {
                     let line = i;
                     let dt = Local::now();
-                    // Use comma for the decimal separator as in dmesg output
-                    let _str = format!(
-                        "{} {}\n",
-                        dt.format("%+").to_string().replace(".", ","),
-                        line
-                    );
+                    let _str = format!("{} {}\n", dt.format(TIME_FORMAT).to_string(), line);
                     write!(f_in, "{}", &_str)?;
                     if !console_off {
                         print!("{}", &_str);
@@ -240,7 +237,7 @@ fn get_line(line: &Option<Result<String, std::io::Error>>) -> Result<String> {
     match line {
         Some(_line) => match _line {
             Ok(v) => {
-                _str = v.to_string() + "\n";
+                _str = v.to_string();
                 return Ok(_str);
             }
             Err(e) => {
@@ -253,15 +250,23 @@ fn get_line(line: &Option<Result<String, std::io::Error>>) -> Result<String> {
     }
 }
 
-fn get_date(line: &Option<Result<String, std::io::Error>>) -> Result<DateTime<FixedOffset>> {
+fn get_line_split(
+    line: &Option<Result<String, std::io::Error>>,
+) -> Result<(DateTime<FixedOffset>, String)> {
     let mut _str: String;
     let date: String;
+    let msg: String;
+    let mut split;
+    let split_to_end: Vec<_>;
 
     match line {
         Some(_line) => match _line {
             Ok(v) => {
                 _str = v.to_string();
-                date = _str.split_ascii_whitespace().next().unwrap().to_string();
+                split = _str.split_whitespace();
+                date = split.next().unwrap().to_string();
+                split_to_end = split.collect();
+                msg = split_to_end.join(" ");
             }
             Err(_) => return Err(anyhow!("Error processing line")),
         },
@@ -273,8 +278,8 @@ fn get_date(line: &Option<Result<String, std::io::Error>>) -> Result<DateTime<Fi
     // journald time format: 2021-09-17T07:24:29.446013+0000
     // dmesg time format: 2021-09-17T07:24:23,364133+00:00
     // chrono fails parsing ISO-8601 when there is a comma for the decimal separator
-    match DateTime::parse_from_str(&date.replace(",", "."), "%Y-%m-%dT%H:%M:%S%.6f%z") {
-        Ok(v) => Ok(v),
+    match DateTime::parse_from_str(&date.replace(",", "."), TIME_FORMAT) {
+        Ok(v) => Ok((v, msg)),
         Err(err) => Err(anyhow!(err)),
     }
 }
@@ -304,9 +309,9 @@ fn merge_logs(rand: &str, args: &Opt) -> Result<()> {
     loop {
         if next_stdin {
             _line_stdin = stdin_lines.next();
-            match get_date(&_line_stdin) {
+            match get_line_split(&_line_stdin) {
                 Ok(v) => {
-                    stdin_date = v;
+                    stdin_date = v.0;
                     next_stdin = false;
                 }
                 Err(_) => {
@@ -317,9 +322,9 @@ fn merge_logs(rand: &str, args: &Opt) -> Result<()> {
 
         if next_syslog {
             _line_syslog = syslog_lines.next();
-            match get_date(&_line_syslog) {
+            match get_line_split(&_line_syslog) {
                 Ok(v) => {
-                    syslog_date = v;
+                    syslog_date = v.0;
                     next_syslog = false;
                 }
                 Err(_) => {
@@ -334,10 +339,10 @@ fn merge_logs(rand: &str, args: &Opt) -> Result<()> {
         }
 
         if syslog_date < stdin_date {
-            write!(f_out, "{}", get_line(&_line_syslog)?)?;
+            writeln!(f_out, "{}", get_line(&_line_syslog)?)?;
             next_syslog = true;
         } else {
-            write!(f_out, "{}", get_line(&_line_stdin)?)?;
+            writeln!(f_out, "{}", get_line(&_line_stdin)?)?;
             next_stdin = true;
         }
     }
@@ -345,7 +350,7 @@ fn merge_logs(rand: &str, args: &Opt) -> Result<()> {
     if end_stdin {
         loop {
             if let Ok(_line) = get_line(&_line_syslog) {
-                write!(f_out, "{}", _line)?;
+                writeln!(f_out, "{}", _line)?;
             } else {
                 break;
             }
@@ -354,7 +359,7 @@ fn merge_logs(rand: &str, args: &Opt) -> Result<()> {
     } else if end_syslog {
         loop {
             if let Ok(_line) = get_line(&_line_stdin) {
-                write!(f_out, "{}", _line)?;
+                writeln!(f_out, "{}", _line)?;
             } else {
                 break;
             }
@@ -390,7 +395,7 @@ fn notify_result(rand: &str, args: &Opt) -> Result<()> {
 
 #[derive(StructOpt)]
 struct Opt {
-    /// Include full dmesg output.
+    /// Include full kernel log output.
     #[structopt(short, long)]
     full: bool,
     /// Write output to <output> instead of a randomly generated file.
@@ -399,16 +404,16 @@ struct Opt {
     /// Do not write to the standard output.
     #[structopt(short, long)]
     console_off: bool,
-    /// Use journald instead of dmesg
+    /// Use dmesg instead of journald
     #[structopt(short, long)]
-    journald: bool,
+    dmesg: bool,
 }
 
 fn main() -> Result<()> {
     let args = Opt::from_args();
     let rand: String = thread_rng()
         .sample_iter(&Alphanumeric)
-        .take(30)
+        .take(16)
         .map(char::from)
         .collect();
     collect_logs(&rand, &args)?;
