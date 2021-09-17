@@ -10,6 +10,7 @@ use rand::{thread_rng, Rng};
 use std::fs::{self, File};
 use std::io::{self, prelude::*, Write};
 use std::process::{ChildStdout, Command, Stdio};
+use std::str;
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use structopt::StructOpt;
@@ -60,22 +61,45 @@ fn collect_syslog(
     rand: &str,
     args: &Opt,
     recv: Receiver<()>,
-) -> Result<thread::JoinHandle<Result<(), anyhow::Error>>> {
+) -> Result<thread::JoinHandle<Result<()>>> {
     let mut f_sys = File::create(get_logfile(SYSLOG_FNAME, rand))?;
     let ctime = Local::now();
     let ctime_iso: String = ctime.format("%+").to_string();
     let ctime_dt = DateTime::parse_from_rfc3339(&ctime_iso).unwrap();
     let full = args.full;
-    let mute = args.mute;
+    let console_off = args.console_off;
+    let journald = args.journald;
 
     let thread = thread::spawn(move || -> Result<()> {
-        let mut logger = Command::new("dmesg")
-            .arg("--time-format")
-            .arg("iso")
-            .arg("-w")
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("Failed to execute dmesg");
+        let mut logger = if journald {
+            // Check we have journal access permissions
+            let test = Command::new("journalctl")
+                .arg("-k")
+                .output()
+                .expect("Failed to execute journalctl");
+            if !test.status.success() {
+                return Err(anyhow!(match str::from_utf8(&test.stderr) {
+                    Ok(v) => v.to_string(),
+                    Err(e) => format!("Err: {}", e),
+                }));
+            }
+            Command::new("journalctl")
+                .arg("-k")
+                .arg("-f")
+                .arg("-o")
+                .arg("short-iso-precise")
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("Failed to execute journalctl")
+        } else {
+            Command::new("dmesg")
+                .arg("--time-format")
+                .arg("iso")
+                .arg("-w")
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("Failed to execute dmesg")
+        };
 
         let rx;
         let reader = io::BufReader::new(logger.stdout.take().expect("Failed to capture stdout"));
@@ -90,7 +114,7 @@ fn collect_syslog(
                     if let Ok(date) = get_date(&Some(Ok(line.clone()))) {
                         if full || date >= ctime_dt {
                             write!(f_sys, "{}", get_line(&Some(Ok(line.clone())))?)?;
-                            if !mute {
+                            if !console_off {
                                 print!("{}", get_line(&Some(Ok(line.clone())))?);
                                 io::stdout().flush().unwrap();
                             }
@@ -139,9 +163,9 @@ fn collect_stdin(
     rand: &str,
     args: &Opt,
     recv: Receiver<()>,
-) -> Result<thread::JoinHandle<Result<(), anyhow::Error>>> {
+) -> Result<thread::JoinHandle<Result<()>>> {
     let mut f_in = File::create(get_logfile(STDIN_FNAME, rand))?;
-    let mute = args.mute;
+    let console_off = args.console_off;
     let thread = thread::spawn(move || -> Result<()> {
         let rx;
         match get_stdin() {
@@ -161,7 +185,7 @@ fn collect_stdin(
                         line
                     );
                     write!(f_in, "{}", &_str)?;
-                    if !mute {
+                    if !console_off {
                         print!("{}", &_str);
                         io::stdout().flush().unwrap();
                     }
@@ -205,12 +229,12 @@ fn collect_logs(rand: &str, args: &Opt) -> Result<()> {
     return Ok(());
 }
 
-fn read_lines(filename: &str) -> Result<io::Lines<io::BufReader<File>>, anyhow::Error> {
+fn read_lines(filename: &str) -> Result<io::Lines<io::BufReader<File>>> {
     let file = File::open(filename).with_context(|| format!("Failed to read {}", filename))?;
     Ok(io::BufReader::new(file).lines())
 }
 
-fn get_line(line: &Option<Result<String, std::io::Error>>) -> Result<String, anyhow::Error> {
+fn get_line(line: &Option<Result<String, std::io::Error>>) -> Result<String> {
     let mut _str: String;
 
     match line {
@@ -229,9 +253,7 @@ fn get_line(line: &Option<Result<String, std::io::Error>>) -> Result<String, any
     }
 }
 
-fn get_date(
-    line: &Option<Result<String, std::io::Error>>,
-) -> Result<DateTime<FixedOffset>, anyhow::Error> {
+fn get_date(line: &Option<Result<String, std::io::Error>>) -> Result<DateTime<FixedOffset>> {
     let mut _str: String;
     let date: String;
 
@@ -248,8 +270,10 @@ fn get_date(
         }
     }
 
+    // journald time format: 2021-09-17T07:24:29.446013+0000
+    // dmesg time format: 2021-09-17T07:24:23,364133+00:00
     // chrono fails parsing ISO-8601 when there is a comma for the decimal separator
-    match DateTime::parse_from_rfc3339(&date.replace(",", ".")) {
+    match DateTime::parse_from_str(&date.replace(",", "."), "%Y-%m-%dT%H:%M:%S%.6f%z") {
         Ok(v) => Ok(v),
         Err(err) => Err(anyhow!(err)),
     }
@@ -358,7 +382,7 @@ fn notify_result(rand: &str, args: &Opt) -> Result<()> {
         }
     }
 
-    if !args.mute || rand_file {
+    if !args.console_off || rand_file {
         println!("\n+ Output written to {}", output_file);
     }
     Ok(())
@@ -374,7 +398,10 @@ struct Opt {
     output: Option<String>,
     /// Do not write to the standard output.
     #[structopt(short, long)]
-    mute: bool,
+    console_off: bool,
+    /// Use journald instead of dmesg
+    #[structopt(short, long)]
+    journald: bool,
 }
 
 fn main() -> Result<()> {
