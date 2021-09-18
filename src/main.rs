@@ -22,15 +22,15 @@ const UNIXTIME: &str = "1970-01-01T00:00:00.000000+00:00";
 const TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6f%z";
 
 fn ctrl_channel() -> Result<(Receiver<()>, Receiver<()>)> {
-    let (sender, receiver) = channel();
+    let (sender1, receiver1) = channel();
     let (sender2, receiver2) = channel();
 
     ctrlc::set_handler(move || {
-        let _ = sender.send(());
+        let _ = sender1.send(());
         let _ = sender2.send(());
     })?;
 
-    Ok((receiver, receiver2))
+    Ok((receiver1, receiver2))
 }
 
 fn get_logfile(name: &str, rand: &str) -> String {
@@ -64,8 +64,7 @@ fn collect_syslog(
     recv: Receiver<()>,
 ) -> Result<thread::JoinHandle<Result<()>>> {
     let mut f_sys = File::create(get_logfile(SYSLOG_FNAME, rand))?;
-    let ctime = Local::now();
-    let ctime_iso: String = ctime.format("%+").to_string();
+    let ctime_iso = Local::now().format("%+").to_string();
     let ctime_dt = DateTime::parse_from_rfc3339(&ctime_iso).unwrap();
     let full = args.full;
     let console_off = args.console_off;
@@ -102,12 +101,11 @@ fn collect_syslog(
                 .expect("Failed to execute journalctl")
         };
 
-        let rx;
         let reader = io::BufReader::new(logger.stdout.take().expect("Failed to capture stdout"));
-        match get_syslog_line(reader) {
-            Ok(r) => rx = r,
+        let rx = match get_syslog_line(reader) {
+            Ok(r) => r,
             Err(_) => return Err(anyhow!("Error generating communication channels")),
-        }
+        };
 
         loop {
             match rx.try_recv() {
@@ -140,7 +138,7 @@ fn collect_syslog(
     return Ok(thread);
 }
 
-fn get_stdin() -> Result<Receiver<String>> {
+fn get_stdin_line() -> Result<Receiver<String>> {
     let (tx, rx) = channel();
     let stdin = io::stdin();
     thread::spawn(move || {
@@ -169,16 +167,14 @@ fn collect_stdin(
     let mut f_in = File::create(get_logfile(STDIN_FNAME, rand))?;
     let console_off = args.console_off;
     let thread = thread::spawn(move || -> Result<()> {
-        let rx;
-        match get_stdin() {
-            Ok(r) => rx = r,
+        let rx = match get_stdin_line() {
+            Ok(r) => r,
             Err(_) => return Err(anyhow!("Error generating communication channels")),
-        }
+        };
 
         loop {
             match rx.try_recv() {
-                Ok(i) => {
-                    let line = i;
+                Ok(line) => {
                     let dt = Local::now();
                     let _str = format!("{} {}\n", dt.format(TIME_FORMAT).to_string(), line);
                     write!(f_in, "{}", &_str)?;
@@ -232,41 +228,29 @@ fn read_lines(filename: &str) -> Result<io::Lines<io::BufReader<File>>> {
 }
 
 fn get_line(line: &Option<Result<String, std::io::Error>>) -> Result<String> {
-    let mut _str: String;
-
     match line {
         Some(_line) => match _line {
-            Ok(v) => {
-                _str = v.to_string();
-                return Ok(_str);
-            }
-            Err(e) => {
-                return Err(anyhow!("Error processing line: {}", e));
-            }
+            Ok(v) => Ok(v.to_string()),
+            Err(e) => Err(anyhow!("Error processing line: {}", e)),
         },
-        None => {
-            return Err(anyhow!("Error processing line"));
-        }
+        None => Err(anyhow!("Error processing line")),
     }
 }
 
 fn get_line_split(
     line: &Option<Result<String, std::io::Error>>,
 ) -> Result<(DateTime<FixedOffset>, String)> {
-    let mut _str: String;
     let date: String;
     let msg: String;
-    let mut split;
-    let split_to_end: Vec<_>;
 
     match line {
         Some(_line) => match _line {
             Ok(v) => {
-                _str = v.to_string();
-                split = _str.split_whitespace();
+                let _str = v.to_string();
+                let mut split = _str.split_whitespace();
                 date = split.next().unwrap().to_string();
-                split_to_end = split.collect();
-                msg = split_to_end.join(" ");
+                let split_end: Vec<_> = split.collect();
+                msg = split_end.join(" ");
             }
             Err(_) => return Err(anyhow!("Error processing line")),
         },
@@ -282,6 +266,22 @@ fn get_line_split(
         Ok(v) => Ok((v, msg)),
         Err(err) => Err(anyhow!(err)),
     }
+}
+
+fn dump_bufreader(
+    f_out: &mut File,
+    mut reader_lines: io::Lines<io::BufReader<File>>,
+    mut curr_line: Option<Result<String, std::io::Error>>,
+) -> Result<()> {
+    loop {
+        if let Ok(_line) = get_line(&curr_line) {
+            writeln!(f_out, "{}", _line)?;
+        } else {
+            break;
+        }
+        curr_line = reader_lines.next();
+    }
+    return Ok(());
 }
 
 fn merge_logs(rand: &str, args: &Opt) -> Result<()> {
@@ -348,23 +348,9 @@ fn merge_logs(rand: &str, args: &Opt) -> Result<()> {
     }
 
     if end_stdin {
-        loop {
-            if let Ok(_line) = get_line(&_line_syslog) {
-                writeln!(f_out, "{}", _line)?;
-            } else {
-                break;
-            }
-            _line_syslog = syslog_lines.next();
-        }
+        dump_bufreader(&mut f_out, syslog_lines, _line_syslog)?;
     } else if end_syslog {
-        loop {
-            if let Ok(_line) = get_line(&_line_stdin) {
-                writeln!(f_out, "{}", _line)?;
-            } else {
-                break;
-            }
-            _line_stdin = stdin_lines.next();
-        }
+        dump_bufreader(&mut f_out, stdin_lines, _line_stdin)?;
     }
 
     Ok(())
@@ -377,15 +363,14 @@ fn remove_tmp_files(rand: &str) -> Result<()> {
 }
 
 fn notify_result(rand: &str, args: &Opt) -> Result<()> {
-    let output_file: String;
     let mut rand_file = false;
-    match &args.output {
-        Some(v) => output_file = v.to_string(),
+    let output_file = match &args.output {
+        Some(v) => v.to_string(),
         None => {
-            output_file = get_logfile(FUSED_FNAME, rand);
-            rand_file = true
+            rand_file = true;
+            get_logfile(FUSED_FNAME, rand)
         }
-    }
+    };
 
     if !args.console_off || rand_file {
         println!("\n+ Output written to {}", output_file);
@@ -398,7 +383,7 @@ struct Opt {
     /// Include full kernel log output.
     #[structopt(short, long)]
     full: bool,
-    /// Write output to <output> instead of a randomly generated file.
+    /// Write output to <output> instead of a random file.
     #[structopt(short, long)]
     output: Option<String>,
     /// Do not write to the standard output.
