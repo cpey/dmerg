@@ -373,7 +373,7 @@ fn notify_result(rand: &str, args: &Opt) -> Result<()> {
     };
 
     if !args.console_off || rand_file {
-        println!("\n+ Output written to {}", output_file);
+        eprintln!("\n+ Output written to {}", output_file);
     }
     Ok(())
 }
@@ -401,8 +401,17 @@ fn main() -> Result<()> {
         .take(16)
         .map(char::from)
         .collect();
-    collect_logs(&rand, &args)?;
-    merge_logs(&rand, &args)?;
+
+    if let Err(e) = collect_logs(&rand, &args) {
+        remove_tmp_files(&rand)?;
+        return Err(anyhow!(e));
+    };
+
+    if let Err(e) = merge_logs(&rand, &args) {
+        remove_tmp_files(&rand)?;
+        return Err(anyhow!(e));
+    }
+
     remove_tmp_files(&rand)?;
     notify_result(&rand, &args)?;
     Ok(())
